@@ -1,0 +1,7 @@
+esphome/secrets.yaml
+esphome/.esphome/
+*.stl
+*.3mf
+case/ref/
+*.zip
+.DS_Store

@@ -1,0 +1,292 @@
+# Solar display: XIAO ePaper Display Board EE04 (XIAO ESP32-S3 Plus)
+# + Waveshare 7.5" V2 e-paper (800x480, 24-pin, jumper on EE04 set to 24-pin)
+#
+# Wake -> connect to HA -> read values -> full refresh -> deep sleep.
+# Turn on input_boolean.solar_display_stay_awake in HA before an OTA update.
+
+substitutions:
+  name: solar-display
+  friendly_name: Solar Display
+  # Entities from your HA (see homeassistant/packages/solar_display.yaml)
+  solar_power_entity: sensor.REPLACE_ME_solar_power   # live solar power in W
+  solar_today_entity: sensor.solar_display_solar_today
+  grid_today_entity: sensor.solar_display_grid_today
+  solar_history_entity: sensor.solar_display_solar_history
+  grid_history_entity: sensor.solar_display_grid_history
+  stay_awake_entity: input_boolean.solar_display_stay_awake
+  # Refresh schedule
+  sleep_duration: 15min
+  night_start_hour: "22"   # from this hour on ...
+  night_end_hour: "6"      # ... until this hour: sleep through
+  wake_time: "06:00:00"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - wait_until:
+          condition:
+            api.connected:
+          timeout: 20s
+      - delay: 3s   # let HA push the subscribed states
+      - output.turn_on: bat_adc_en
+      - delay: 20ms
+      - component.update: battery_voltage
+      - output.turn_off: bat_adc_en
+      - component.update: battery_level
+      - component.update: wifi_rssi
+      - component.update: epaper
+      - delay: 2s   # finish refresh and flush API messages before sleeping
+      - globals.set:
+          id: render_done
+          value: "true"
+      - script.execute: go_to_sleep
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # GPIO43/44 are used by the display
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption: {}   # reuses the api encryption key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  # A static IP shortens every wake noticeably:
+  # manual_ip:
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+globals:
+  - id: render_done
+    type: bool
+    initial_value: "false"
+
+deep_sleep:
+  id: sleep_ctl
+  sleep_duration: ${sleep_duration}
+  wakeup_pin:              # KEY0 wakes the display for an immediate refresh
+    number: GPIO2
+    inverted: true
+    mode:
+      input: true
+      pullup: true
+
+script:
+  - id: go_to_sleep
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: stay_awake
+          then:
+            - logger.log: "Stay-awake is on, not sleeping"
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    auto now = id(ha_time).now();
+                    return now.is_valid() &&
+                           (now.hour >= ${night_start_hour} || now.hour < ${night_end_hour});
+                then:
+                  - deep_sleep.enter:
+                      id: sleep_ctl
+                      until: "${wake_time}"
+                      time_id: ha_time
+                else:
+                  - deep_sleep.enter: sleep_ctl
+
+spi:
+  clk_pin: GPIO7    # D8
+  mosi_pin: GPIO9   # D10
+
+output:
+  - platform: gpio
+    id: bat_adc_en
+    pin: GPIO6      # enables the battery voltage divider
+
+switch:
+  - platform: gpio
+    id: epd_power
+    pin: GPIO43     # e-paper power enable
+    restore_mode: ALWAYS_ON
+    internal: true
+
+binary_sensor:
+  - platform: homeassistant
+    id: stay_awake
+    entity_id: ${stay_awake_entity}
+    on_release:
+      - if:
+          condition:
+            lambda: return id(render_done);
+          then:
+            - script.execute: go_to_sleep
+
+sensor:
+  - platform: homeassistant
+    id: solar_power
+    entity_id: ${solar_power_entity}
+  - platform: homeassistant
+    id: solar_today
+    entity_id: ${solar_today_entity}
+  - platform: homeassistant
+    id: grid_today
+    entity_id: ${grid_today_entity}
+
+  - platform: adc
+    id: battery_voltage
+    name: "Battery Voltage"
+    pin: GPIO1      # A0
+    attenuation: 12db
+    update_interval: never
+    accuracy_decimals: 2
+    device_class: voltage
+    entity_category: diagnostic
+    filters:
+      - multiply: 2.0   # divider ratio, calibrate against a multimeter
+
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (std::isnan(v)) return NAN;
+      // rough resting-voltage curve of a 1S LiPo
+      static const float pts[][2] = {{4.15f, 100}, {4.00f, 85}, {3.90f, 72}, {3.80f, 55},
+                                     {3.70f, 35},  {3.60f, 15}, {3.50f, 5},  {3.30f, 0}};
+      if (v >= pts[0][0]) return 100.0f;
+      for (int i = 1; i < 8; i++) {
+        if (v >= pts[i][0]) {
+          float t = (v - pts[i][0]) / (pts[i - 1][0] - pts[i][0]);
+          return pts[i][1] + t * (pts[i - 1][1] - pts[i][1]);
+        }
+      }
+      return 0.0f;
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: never
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: homeassistant
+    id: solar_hist
+    entity_id: ${solar_history_entity}
+    attribute: csv
+  - platform: homeassistant
+    id: grid_hist
+    entity_id: ${grid_history_entity}
+    attribute: csv
+
+font:
+  - { file: "gfonts://Inter@700", id: f_big, size: 72 }
+  - { file: "gfonts://Inter@500", id: f_med, size: 30 }
+  - { file: "gfonts://Inter@500", id: f_small, size: 22 }
+  - { file: "gfonts://Inter", id: f_tiny, size: 16 }
+
+display:
+  - platform: waveshare_epaper
+    id: epaper
+    model: 7.50inV2
+    cs_pin: GPIO44
+    dc_pin: GPIO10
+    reset_pin: GPIO38
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    update_interval: never
+    lambda: |-
+      // Big value + smaller unit, left aligned at (x, y)
+      auto value = [&](int x, int y, const char *num, const char *unit) {
+        int bx, by, bw, bh;
+        it.print(x, y, id(f_big), num);
+        it.get_text_bounds(x, y, num, id(f_big), TextAlign::TOP_LEFT, &bx, &by, &bw, &bh);
+        it.print(x + bw + 8, y + 34, id(f_med), unit);
+      };
+
+      // 24 bars from a "1;2;3" history string, newest on the right
+      auto bars = [&](int x, int y, int w, int h, const std::string &csv, const char *title) {
+        std::vector<float> v;
+        size_t start = 0;
+        while (start <= csv.size()) {
+          size_t end = csv.find(';', start);
+          if (end == std::string::npos) end = csv.size();
+          if (end > start) v.push_back(atof(csv.substr(start, end - start).c_str()));
+          start = end + 1;
+        }
+        it.print(x, y, id(f_small), title);
+        int cy = y + 32, ch = h - 32 - 18;
+        it.line(x, cy + ch, x + w, cy + ch);
+        if (v.empty()) {
+          it.print(x + w / 2, cy + ch / 2, id(f_tiny), TextAlign::CENTER, "collecting data...");
+          return;
+        }
+        float vmax = 1;
+        for (float f : v) vmax = std::max(vmax, f);
+        const int n = 24;
+        int slot = w / n;
+        int offset = n - (int) v.size();
+        for (size_t i = 0; i < v.size(); i++) {
+          int bh = (int) (v[i] / vmax * (ch - 2));
+          if (bh > 0) it.filled_rectangle(x + (offset + i) * slot + 1, cy + ch - bh, slot - 2, bh);
+        }
+        char buf[24];
+        snprintf(buf, sizeof(buf), "max %.0f Wh", vmax);
+        it.print(x + w, y + 4, id(f_tiny), TextAlign::TOP_RIGHT, buf);
+        it.print(x, cy + ch + 2, id(f_tiny), "-24h");
+        it.print(x + w, cy + ch + 2, id(f_tiny), TextAlign::TOP_RIGHT, "now");
+      };
+
+      char num[16];
+
+      // --- Solar (left) ---
+      it.print(24, 16, id(f_small), "SOLAR NOW");
+      float pw = id(solar_power).state;
+      if (std::isnan(pw)) value(24, 44, "--", "W");
+      else if (pw >= 1000) { snprintf(num, sizeof(num), "%.2f", pw / 1000); value(24, 44, num, "kW"); }
+      else { snprintf(num, sizeof(num), "%.0f", pw); value(24, 44, num, "W"); }
+      if (!std::isnan(id(solar_today).state))
+        it.printf(24, 136, id(f_med), "today %.1f kWh", id(solar_today).state);
+
+      it.line(400, 20, 400, 176);
+
+      // --- Grid (right) ---
+      it.print(424, 16, id(f_small), "GRID TODAY");
+      float gk = id(grid_today).state;
+      if (std::isnan(gk)) value(424, 44, "--", "kWh");
+      else { snprintf(num, sizeof(num), "%.1f", gk); value(424, 44, num, "kWh"); }
+
+      // --- Charts ---
+      bars(24, 196, 352, 250, id(solar_hist).state, "Solar per hour");
+      bars(424, 196, 352, 250, id(grid_hist).state, "Grid per hour");
+
+      // --- Footer ---
+      auto now = id(ha_time).now();
+      if (now.is_valid()) it.strftime(24, 458, id(f_tiny), "updated %H:%M", now);
+      it.printf(776, 458, id(f_tiny), TextAlign::TOP_RIGHT, "battery %.0f%%   wifi %.0f dBm",
+                id(battery_level).state, id(wifi_rssi).state);

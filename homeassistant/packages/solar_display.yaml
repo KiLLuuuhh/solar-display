@@ -1,0 +1,101 @@
+# Home Assistant package for the solar e-paper display.
+#
+# Install: copy to <config>/packages/solar_display.yaml and enable packages in
+# configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# Replace the two REPLACE_ME entities:
+#   sensor.REPLACE_ME_solar_power   live solar power in W
+#   sensor.REPLACE_ME_grid_energy   energy from the power provider in kWh
+#                                   (a counter, total or daily-resetting)
+# If the provider entity is power (W) instead of energy (kWh), use the
+# commented integration sensor below and point the grid meters at it.
+
+input_boolean:
+  solar_display_stay_awake:
+    name: Solar Display stay awake
+    icon: mdi:sleep-off
+
+sensor:
+  # Solar power (W) -> energy (kWh)
+  - platform: integration
+    source: sensor.REPLACE_ME_solar_power
+    name: Solar Display Solar Energy
+    unique_id: solar_display_solar_energy
+    unit_prefix: k
+    unit_time: h
+    method: left
+    round: 3
+
+  # Only needed if the provider entity is power (W):
+  # - platform: integration
+  #   source: sensor.REPLACE_ME_grid_power
+  #   name: Solar Display Grid Energy
+  #   unique_id: solar_display_grid_energy
+  #   unit_prefix: k
+  #   unit_time: h
+  #   method: left
+  #   round: 3
+
+utility_meter:
+  solar_display_solar_hourly:
+    name: Solar Display Solar Hourly
+    source: sensor.solar_display_solar_energy
+    cycle: hourly
+  solar_display_solar_today:
+    name: Solar Display Solar Today
+    source: sensor.solar_display_solar_energy
+    cycle: daily
+  solar_display_grid_hourly:
+    name: Solar Display Grid Hourly
+    source: sensor.REPLACE_ME_grid_energy
+    cycle: hourly
+  solar_display_grid_today:
+    name: Solar Display Grid Today
+    source: sensor.REPLACE_ME_grid_energy
+    cycle: daily
+
+# Rolling 24h history for the bar charts. Each hour the finished hour's energy
+# (Wh) is appended to the "csv" attribute, e.g. "0;0;120;480;...".
+# ';' is used on purpose: "1,2,3" would be parsed by HA into a tuple.
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: 0
+        seconds: 30
+    sensor:
+      - name: Solar Display Solar History
+        unique_id: solar_display_solar_history
+        unit_of_measurement: Wh
+        state: >
+          {{ (state_attr('sensor.solar_display_solar_hourly', 'last_period') | float(0) * 1000) | round(0) }}
+        attributes:
+          csv: >
+            {% set prev = (this.attributes.csv | default('') | string).split(';') | reject('eq', '') | list %}
+            {% set v = (state_attr('sensor.solar_display_solar_hourly', 'last_period') | float(0) * 1000) | round(0) | int %}
+            {{ (prev + [v | string])[-24:] | join(';') }}
+      - name: Solar Display Grid History
+        unique_id: solar_display_grid_history
+        unit_of_measurement: Wh
+        state: >
+          {{ (state_attr('sensor.solar_display_grid_hourly', 'last_period') | float(0) * 1000) | round(0) }}
+        attributes:
+          csv: >
+            {% set prev = (this.attributes.csv | default('') | string).split(';') | reject('eq', '') | list %}
+            {% set v = (state_attr('sensor.solar_display_grid_hourly', 'last_period') | float(0) * 1000) | round(0) | int %}
+            {{ (prev + [v | string])[-24:] | join(';') }}
+
+automation:
+  - id: solar_display_low_battery
+    alias: "Solar Display: battery low"
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.solar_display_battery_level
+        below: 15
+    actions:
+      - action: notify.notify   # replace with e.g. notify.mobile_app_<phone>
+        data:
+          title: Solar Display
+          message: >
+            Battery at {{ states('sensor.solar_display_battery_level') }} % - please charge.
